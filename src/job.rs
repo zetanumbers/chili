@@ -8,7 +8,10 @@ use std::{
     thread::{self, Thread},
 };
 
-use crate::Scope;
+use crate::{
+    tlv::{self, Tlv},
+    Scope,
+};
 
 enum Poll {
     Pending,
@@ -134,6 +137,7 @@ pub struct Job<T = ()> {
     stack: NonNull<JobStack>,
     harness: unsafe fn(&mut Scope<'_>, NonNull<JobStack>, NonNull<Future>),
     fut: Cell<Option<NonNull<Future<T>>>>,
+    tlv: Tlv,
 }
 
 impl<T> Job<T> {
@@ -172,6 +176,7 @@ impl<T> Job<T> {
             stack: NonNull::from(stack).cast(),
             harness: harness::<F, T>,
             fut: Cell::new(None),
+            tlv: tlv::get(),
         }
     }
 
@@ -233,12 +238,15 @@ impl Job {
     /// It should only be called while the `JobStack` it was created with is
     /// still alive and after being popped from a `JobQueue`.
     pub unsafe fn execute(&self, scope: &mut Scope<'_>) {
+        let old_tlv = tlv::get();
+        tlv::set(self.tlv);
         // SAFETY:
         // Before being popped, the `JobQueue` allocates and store a
         // `Future` in `self.fur_or_next` that should get passed here.
         unsafe {
             (self.harness)(scope, self.stack, self.fut.get().unwrap());
         }
+        tlv::set(old_tlv);
     }
 }
 

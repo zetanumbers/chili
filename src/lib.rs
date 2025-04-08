@@ -61,6 +61,7 @@ use std::{
 };
 
 mod job;
+pub mod tlv;
 
 use job::{Job, JobQueue, JobStack};
 
