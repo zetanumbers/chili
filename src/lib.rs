@@ -65,15 +65,19 @@ pub mod tlv;
 
 use job::{Job, JobQueue, JobStack};
 
+/// The type for a closure that gets invoked when the Chili thread pool deadlocks
+type DeadlockHandler = dyn Fn() + Send + Sync;
+
 #[derive(Debug)]
 struct Heartbeat {
     is_set: Weak<AtomicBool>,
     last_heartbeat: Instant,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LockContext {
     time: u64,
+    unblocked_threads: usize,
     is_stopping: bool,
     shared_jobs: BTreeMap<usize, (u64, Job)>,
     heartbeats: HashMap<u64, Heartbeat>,
@@ -81,6 +85,17 @@ struct LockContext {
 }
 
 impl LockContext {
+    fn new(unblocked_threads: usize) -> Self {
+        Self {
+            unblocked_threads,
+            time: 0,
+            is_stopping: false,
+            shared_jobs: BTreeMap::new(),
+            heartbeats: HashMap::new(),
+            heartbeat_index: 0,
+        }
+    }
+
     pub fn new_heartbeat(&mut self) -> Arc<AtomicBool> {
         let is_set = Arc::new(AtomicBool::new(true));
         let heartbeat = Heartbeat {
@@ -535,7 +550,6 @@ impl<'s> Scope<'s> {
 }
 
 /// `ThreadPool` configuration.
-#[derive(Debug)]
 pub struct Config {
     /// The number of threads or `None` to use
     /// `std::thread::available_parallelism`.
@@ -544,6 +558,8 @@ pub struct Config {
     pub heartbeat_interval: Duration,
     /// Worker threads' stack size in bytes
     pub stack_size: Option<NonZero<usize>>,
+    /// Closure invoked on deadlock.
+    pub deadlock_handler: Option<Box<DeadlockHandler>>,
 }
 
 impl Default for Config {
@@ -552,6 +568,7 @@ impl Default for Config {
             thread_count: None,
             heartbeat_interval: Duration::from_micros(100),
             stack_size: None,
+            deadlock_handler: None,
         }
     }
 }
@@ -559,11 +576,12 @@ impl Default for Config {
 static GLOBAL_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
 /// A thread pool for running fork-join workloads.
-#[derive(Debug)]
 pub struct ThreadPool {
     context: Arc<Context>,
+    thread_count: usize,
     worker_handles: Vec<JoinHandle<()>>,
     heartbeat_handle: Option<JoinHandle<()>>,
+    deadlock_handler: Option<Box<DeadlockHandler>>,
 }
 
 impl ThreadPool {
@@ -590,6 +608,7 @@ impl ThreadPool {
     ///     thread_count: Some(NonZero::new(1).unwrap()),
     ///     heartbeat_interval: Duration::from_micros(50),
     ///     stack_size: Some(NonZero::new(128 * 1024).unwrap()),
+    ///     ..Config::default()
     /// });
     /// ```
     pub fn with_config(config: Config) -> Self {
@@ -601,7 +620,7 @@ impl ThreadPool {
         let worker_barrier = Arc::new(Barrier::new(thread_count + 1));
 
         let context = Arc::new(Context {
-            lock: Mutex::new(LockContext::default()),
+            lock: Mutex::new(LockContext::new(thread_count)),
             job_is_ready: Condvar::new(),
             scope_created_from_thread_pool: Condvar::new(),
         });
@@ -625,11 +644,13 @@ impl ThreadPool {
         worker_barrier.wait();
 
         Self {
+            thread_count,
             context: context.clone(),
             worker_handles,
             heartbeat_handle: Some(thread::spawn(move || {
                 execute_heartbeat(context, config.heartbeat_interval, thread_count);
             })),
+            deadlock_handler: config.deadlock_handler,
         }
     }
 
@@ -646,7 +667,7 @@ impl ThreadPool {
         let worker_barrier = Arc::new(Barrier::new(thread_count + 1));
 
         let context = Arc::new(Context {
-            lock: Mutex::new(LockContext::default()),
+            lock: Mutex::new(LockContext::new(thread_count)),
             job_is_ready: Condvar::new(),
             scope_created_from_thread_pool: Condvar::new(),
         });
@@ -670,12 +691,14 @@ impl ThreadPool {
             }
 
             let pool = ThreadPool {
+                thread_count,
                 context: context.clone(),
-                // FIXME: join is gandled by
+                // FIXME: join is handled by drop impl
                 worker_handles: Vec::new(),
                 heartbeat_handle: Some(thread::spawn(move || {
                     execute_heartbeat(context, config.heartbeat_interval, thread_count);
                 })),
+                deadlock_handler: config.deadlock_handler,
             };
 
             Ok(with_pool(&pool))
@@ -696,8 +719,10 @@ impl ThreadPool {
     ///     thread_count: Some(NonZero::new(1).unwrap()),
     ///     heartbeat_interval: Duration::from_micros(50),
     ///     stack_size: Some(NonZero::new(128 * 1024).unwrap()),
+    ///     ..Config::default()
     /// })
     /// .set_global()
+    /// .ok()
     /// .unwrap();
     /// ```
     pub fn set_global(self) -> Result<(), Self> {
@@ -741,6 +766,22 @@ impl ThreadPool {
     /// ```
     pub fn scope(&self) -> Scope<'_> {
         Scope::new_from_thread_pool(self)
+    }
+
+    pub fn mark_blocked(&self) {
+        let mut lcx = self.context.lock.lock().unwrap();
+        lcx.unblocked_threads = lcx.unblocked_threads.checked_sub(1).unwrap();
+        if lcx.unblocked_threads == 0 {
+            if let Some(handler) = self.deadlock_handler.as_ref() {
+                handler()
+            }
+        }
+    }
+
+    pub fn mark_unblocked(&self) {
+        let mut lcx = self.context.lock.lock().unwrap();
+        lcx.unblocked_threads += 1;
+        assert!(lcx.unblocked_threads <= self.thread_count);
     }
 }
 
@@ -891,6 +932,7 @@ mod tests {
             thread_count: Some(NonZero::new(2).unwrap()),
             heartbeat_interval: Duration::from_micros(1),
             stack_size: None,
+            deadlock_handler: None,
         });
 
         if let Some(thread_count) = thread::available_parallelism().ok().map(NonZero::get) {
