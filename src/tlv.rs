@@ -11,7 +11,9 @@ thread_local! {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Tlv(pub(crate) *const ());
 
+// SAFETY: TLV is expected to be shared across threads
 unsafe impl Sync for Tlv {}
+// SAFETY: TLV is expected to be transferred across threads
 unsafe impl Send for Tlv {}
 
 /// Sets the current thread-local value

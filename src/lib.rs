@@ -1,4 +1,3 @@
-#![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -49,12 +48,13 @@
 
 use std::{
     collections::{btree_map::Entry, BTreeMap, HashMap},
+    io,
     num::NonZero,
     ops::{Deref, DerefMut},
     panic,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Barrier, Condvar, Mutex, OnceLock, Weak,
+        mpsc, Arc, Barrier, Condvar, LockResult, Mutex, OnceLock, PoisonError, Weak,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -110,7 +110,34 @@ struct Context {
     scope_created_from_thread_pool: Condvar,
 }
 
-fn execute_worker(context: Arc<Context>, barrier: Arc<Barrier>) -> Option<()> {
+/// Thread builder used to initialize thread-locals via
+/// [`ThreadPoolBuilder::spawn_handler`](struct.ThreadPoolBuilder.html#method.spawn_handler).
+pub struct ThreadBuilder {
+    stack_size: Option<NonZero<usize>>,
+    context: Arc<Context>,
+    barrier: Arc<Barrier>,
+    index: usize,
+}
+
+impl ThreadBuilder {
+    /// Gets the index of this thread in the pool, within `0..num_threads`.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Gets the value that was specified by `ThreadPoolBuilder::stack_size()`.
+    pub fn stack_size(&self) -> Option<NonZero<usize>> {
+        self.stack_size
+    }
+
+    /// Executes the main loop for this thread. This will not return until the
+    /// thread pool is dropped.
+    pub fn run(self) {
+        let _ = execute_worker(self.context, self.barrier);
+    }
+}
+
+fn execute_worker(context: Arc<Context>, barrier: Arc<Barrier>) -> LockResult<()> {
     let mut first_run = true;
 
     let mut job_queue = JobQueue::default();
@@ -136,13 +163,14 @@ fn execute_worker(context: Arc<Context>, barrier: Arc<Barrier>) -> Option<()> {
             barrier.wait();
         };
 
-        let lock = context.lock.lock().ok()?;
+        let lock = context.lock.lock().map_err(|_| PoisonError::new(()))?;
+        // TODO: acquire/release_thread
         if lock.is_stopping || context.job_is_ready.wait(lock).is_err() {
             break;
         }
     }
 
-    Some(())
+    Ok(())
 }
 
 fn execute_heartbeat(
@@ -342,6 +370,18 @@ impl<'s> Scope<'s> {
         self.heartbeat.store(false, Ordering::Relaxed);
     }
 
+    fn share_job(&mut self, job: Job) {
+        let mut lock = self.context.lock.lock().unwrap();
+
+        let time = lock.time;
+        if let Entry::Vacant(e) = lock.shared_jobs.entry(self.heartbeat_id()) {
+            e.insert((time, job));
+
+            lock.time += 1;
+            self.context.job_is_ready.notify_one();
+        }
+    }
+
     fn join_seq<A, B, RA, RB>(&mut self, a: A, b: B) -> (RA, RB)
     where
         A: FnOnce(&mut Scope<'_>) -> RA + Send,
@@ -470,6 +510,28 @@ impl<'s> Scope<'s> {
             self.join_seq(a, b)
         }
     }
+
+    pub fn install<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Scope<'_>) -> R + Send,
+        R: Send,
+    {
+        // FIXME: Temporary workaround
+        let (tx, rx) = mpsc::sync_channel(1);
+        let f = move |scope: &mut Scope<'_>| {
+            if scope.heartbeat.load(Ordering::Relaxed) {
+                scope.heartbeat();
+            }
+
+            tx.send(f(scope)).unwrap();
+        };
+
+        let stack = JobStack::new(f);
+        let job = Job::new(&stack);
+
+        self.share_job(job);
+        rx.recv().unwrap()
+    }
 }
 
 /// `ThreadPool` configuration.
@@ -480,6 +542,8 @@ pub struct Config {
     pub thread_count: Option<NonZero<usize>>,
     /// The interval between heartbeats on any particular thread.
     pub heartbeat_interval: Duration,
+    /// Worker threads' stack size in bytes
+    pub stack_size: Option<NonZero<usize>>,
 }
 
 impl Default for Config {
@@ -487,6 +551,7 @@ impl Default for Config {
         Self {
             thread_count: None,
             heartbeat_interval: Duration::from_micros(100),
+            stack_size: None,
         }
     }
 }
@@ -524,6 +589,7 @@ impl ThreadPool {
     /// let _tp = ThreadPool::with_config(Config {
     ///     thread_count: Some(NonZero::new(1).unwrap()),
     ///     heartbeat_interval: Duration::from_micros(50),
+    ///     stack_size: Some(NonZero::new(128 * 1024).unwrap()),
     /// });
     /// ```
     pub fn with_config(config: Config) -> Self {
@@ -544,9 +610,15 @@ impl ThreadPool {
             .map(|_| {
                 let context = context.clone();
                 let barrier = worker_barrier.clone();
-                thread::spawn(move || {
-                    execute_worker(context, barrier);
-                })
+                let mut builder = thread::Builder::new();
+                if let Some(stack_size) = config.stack_size {
+                    builder = builder.stack_size(stack_size.get());
+                }
+                builder
+                    .spawn(move || {
+                        let _ = execute_worker(context, barrier);
+                    })
+                    .expect("Spawning worker threads")
             })
             .collect();
 
@@ -559,6 +631,55 @@ impl ThreadPool {
                 execute_heartbeat(context, config.heartbeat_interval, thread_count);
             })),
         }
+    }
+
+    pub fn scoped_with_config<W, F, R>(config: Config, wrapper: W, with_pool: F) -> io::Result<R>
+    where
+        W: Fn(ThreadBuilder) + Sync, // expected to call `run()`
+        F: FnOnce(&Self) -> R,
+    {
+        let thread_count = config
+            .thread_count
+            .or_else(|| thread::available_parallelism().ok())
+            .map(|thread_count| thread_count.get())
+            .unwrap_or_default();
+        let worker_barrier = Arc::new(Barrier::new(thread_count + 1));
+
+        let context = Arc::new(Context {
+            lock: Mutex::new(LockContext::default()),
+            job_is_ready: Condvar::new(),
+            scope_created_from_thread_pool: Condvar::new(),
+        });
+
+        std::thread::scope(|scope| {
+            let wrapper = &wrapper;
+
+            for index in 0..thread_count {
+                let thread = ThreadBuilder {
+                    stack_size: config.stack_size,
+                    context: context.clone(),
+                    barrier: worker_barrier.clone(),
+                    index,
+                };
+                let mut builder = thread::Builder::new();
+                if let Some(size) = thread.stack_size() {
+                    builder = builder.stack_size(size.get());
+                }
+                // FIXME: cleanup spawned threads
+                builder.spawn_scoped(scope, move || wrapper(thread))?;
+            }
+
+            let pool = ThreadPool {
+                context: context.clone(),
+                // FIXME: join is gandled by
+                worker_handles: Vec::new(),
+                heartbeat_handle: Some(thread::spawn(move || {
+                    execute_heartbeat(context, config.heartbeat_interval, thread_count);
+                })),
+            };
+
+            Ok(with_pool(&pool))
+        })
     }
 
     /// Sets the global thread pool to this one.
@@ -574,6 +695,7 @@ impl ThreadPool {
     /// ThreadPool::with_config(Config {
     ///     thread_count: Some(NonZero::new(1).unwrap()),
     ///     heartbeat_interval: Duration::from_micros(50),
+    ///     stack_size: Some(NonZero::new(128 * 1024).unwrap()),
     /// })
     /// .set_global()
     /// .unwrap();
@@ -768,6 +890,7 @@ mod tests {
         let threat_pool = ThreadPool::with_config(Config {
             thread_count: Some(NonZero::new(2).unwrap()),
             heartbeat_interval: Duration::from_micros(1),
+            stack_size: None,
         });
 
         if let Some(thread_count) = thread::available_parallelism().ok().map(NonZero::get) {
