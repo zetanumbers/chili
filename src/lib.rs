@@ -164,14 +164,15 @@ fn execute_heartbeat(
 
             let now = Instant::now();
             lock.heartbeats.retain(|_, h| {
-                let Some(is_set) = h.is_set.upgrade() else {
-                    return false;
-                };
-                if now.duration_since(h.last_heartbeat) >= heartbeat_interval {
-                    is_set.store(true, Ordering::Relaxed);
-                    h.last_heartbeat = now;
-                }
-                true
+                h.is_set
+                    .upgrade()
+                    .inspect(|is_set| {
+                        if now.duration_since(h.last_heartbeat) >= heartbeat_interval {
+                            is_set.store(true, Ordering::Relaxed);
+                            h.last_heartbeat = now;
+                        }
+                    })
+                    .is_some()
             });
 
             heartbeat_interval.checked_div(lock.heartbeats.len() as u32)
