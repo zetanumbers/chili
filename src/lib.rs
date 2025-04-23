@@ -48,7 +48,6 @@
 //! ```
 
 use std::{
-    cell::Cell,
     collections::{btree_map::Entry, BTreeMap, HashMap},
     num::NonZero,
     ops::{Deref, DerefMut},
@@ -68,7 +67,7 @@ use job::{Job, JobQueue, JobStack};
 #[derive(Debug)]
 struct Heartbeat {
     is_set: Weak<AtomicBool>,
-    last_heartbeat: Cell<Instant>,
+    last_heartbeat: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -85,7 +84,7 @@ impl LockContext {
         let is_set = Arc::new(AtomicBool::new(true));
         let heartbeat = Heartbeat {
             is_set: Arc::downgrade(&is_set),
-            last_heartbeat: Cell::new(Instant::now()),
+            last_heartbeat: Instant::now(),
         };
 
         let i = self.heartbeat_index;
@@ -168,9 +167,9 @@ fn execute_heartbeat(
                 h.is_set
                     .upgrade()
                     .inspect(|is_set| {
-                        if now.duration_since(h.last_heartbeat.get()) >= heartbeat_interval {
+                        if now.duration_since(h.last_heartbeat) >= heartbeat_interval {
                             is_set.store(true, Ordering::Relaxed);
-                            h.last_heartbeat.set(now);
+                            h.last_heartbeat = now;
                         }
                     })
                     .is_some()
