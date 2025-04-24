@@ -1,5 +1,4 @@
 #![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 //! # chili. Rust port of [Spice], a low-overhead parallelization library
 //!
@@ -47,14 +46,15 @@
 //! ```
 
 use std::{
+    cell::Cell,
     collections::{btree_map::Entry, BTreeMap, HashMap},
     io,
     num::NonZero,
     ops::{Deref, DerefMut},
-    panic,
+    panic, ptr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Barrier, Condvar, LockResult, Mutex, OnceLock, PoisonError, Weak,
+        mpsc, Arc, Barrier, Condvar, LockResult, Mutex, PoisonError, Weak,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -291,8 +291,11 @@ impl<'s> Scope<'s> {
     /// # use chili::Scope;
     /// let _s = Scope::global();
     /// ```
-    pub fn global() -> Scope<'static> {
-        ThreadPool::global().scope()
+    pub fn with_current<F, R>(f: F) -> Option<R>
+    where
+        F: FnOnce(Scope<'_>) -> R,
+    {
+        ThreadPool::with_current(|pool| f(pool.scope()))
     }
 
     fn new_from_thread_pool(thread_pool: &'s ThreadPool) -> Self {
@@ -573,7 +576,9 @@ impl Default for Config {
     }
 }
 
-static GLOBAL_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
+thread_local! {
+    static REGISTERED_THREAD_POOL: Cell<*const ThreadPool> = const { Cell::new(ptr::null()) };
+}
 
 /// A thread pool for running fork-join workloads.
 pub struct ThreadPool {
@@ -675,20 +680,22 @@ impl ThreadPool {
         std::thread::scope(|scope| {
             let wrapper = &wrapper;
 
-            for index in 0..thread_count {
-                let thread = ThreadBuilder {
-                    stack_size: config.stack_size,
-                    context: context.clone(),
-                    barrier: worker_barrier.clone(),
-                    index,
-                };
-                let mut builder = thread::Builder::new();
-                if let Some(size) = thread.stack_size() {
-                    builder = builder.stack_size(size.get());
-                }
-                // FIXME: cleanup spawned threads
-                builder.spawn_scoped(scope, move || wrapper(thread))?;
-            }
+            // FIXME: cleanup spawned threads on error
+            let worker_handles = (0..thread_count)
+                .map(|index| {
+                    let thread = ThreadBuilder {
+                        stack_size: config.stack_size,
+                        context: context.clone(),
+                        barrier: worker_barrier.clone(),
+                        index,
+                    };
+                    let mut builder = thread::Builder::new();
+                    if let Some(size) = thread.stack_size() {
+                        builder = builder.stack_size(size.get());
+                    }
+                    builder.spawn_scoped(scope, move || wrapper(thread))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             worker_barrier.wait();
 
@@ -702,11 +709,13 @@ impl ThreadPool {
                 })),
                 deadlock_handler: config.deadlock_handler,
             };
-            pool.set_global()
-                .ok()
-                .expect("Global thread pool is already set");
-
-            Ok(with_pool())
+            let result = pool.register(with_pool);
+            drop(pool);
+            worker_handles.into_iter().for_each(|worker| {
+                // FIXME: to ignore panics or not to?
+                let _ = worker.join();
+            });
+            Ok(result)
         })
     }
 
@@ -730,8 +739,19 @@ impl ThreadPool {
     /// .ok()
     /// .unwrap();
     /// ```
-    pub fn set_global(self) -> Result<(), Self> {
-        GLOBAL_THREAD_POOL.set(self)
+    pub fn register<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        struct RestorePool(*const ThreadPool);
+        impl Drop for RestorePool {
+            fn drop(&mut self) {
+                REGISTERED_THREAD_POOL.set(self.0);
+            }
+        }
+
+        let _old_pool = RestorePool(REGISTERED_THREAD_POOL.replace(self));
+        f()
     }
 
     /// Returns the global thread pool.
@@ -749,8 +769,11 @@ impl ThreadPool {
     ///
     /// assert_eq!(vals, [1; 2]);
     /// ```
-    pub fn global() -> &'static ThreadPool {
-        GLOBAL_THREAD_POOL.get_or_init(ThreadPool::new)
+    pub fn with_current<F, R>(f: F) -> Option<R>
+    where
+        F: FnOnce(&ThreadPool) -> R,
+    {
+        unsafe { REGISTERED_THREAD_POOL.get().as_ref() }.map(f)
     }
 
     /// Returns a `Scope`d object that you can run fork-join workloads on.
