@@ -46,12 +46,12 @@
 //! ```
 
 use std::{
-    cell::Cell,
+    cell::RefCell,
     collections::{btree_map::Entry, BTreeMap, HashMap},
     io,
     num::NonZero,
     ops::{Deref, DerefMut},
-    panic, ptr,
+    panic,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Barrier, Condvar, LockResult, Mutex, PoisonError, Weak,
@@ -125,6 +125,35 @@ struct Context {
     scope_created_from_thread_pool: Condvar,
 }
 
+impl Context {
+    fn new_from_thread_pool<'s>(self: Arc<Self>) -> Scope<'s> {
+        let heartbeat = self.lock.lock().unwrap().new_heartbeat();
+        self.scope_created_from_thread_pool.notify_one();
+
+        Scope {
+            context: self,
+            job_queue: ThreadJobQueue::Current(JobQueue::default()),
+            heartbeat,
+            join_count: 0,
+        }
+    }
+
+    fn register<F, R>(self: Arc<Self>, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        struct RestorePool(Option<Arc<Context>>);
+        impl Drop for RestorePool {
+            fn drop(&mut self) {
+                REGISTERED_CONTEXT.set(self.0.take());
+            }
+        }
+
+        let _old_pool = RestorePool(REGISTERED_CONTEXT.replace(Some(self)));
+        f()
+    }
+}
+
 /// Thread builder used to initialize thread-locals via
 /// [`ThreadPoolBuilder::spawn_handler`](struct.ThreadPoolBuilder.html#method.spawn_handler).
 pub struct ThreadBuilder {
@@ -155,37 +184,38 @@ impl ThreadBuilder {
 fn execute_worker(context: Arc<Context>, barrier: Arc<Barrier>) -> LockResult<()> {
     let mut first_run = true;
 
-    let mut job_queue = JobQueue::default();
-    let mut scope = Scope::new_from_worker(context.clone(), &mut job_queue);
+    context.clone().register(|| {
+        let mut job_queue = JobQueue::default();
+        let mut scope = Scope::new_from_worker(context.clone(), &mut job_queue);
 
-    loop {
-        let job = {
-            let mut lock = context.lock.lock().unwrap();
-            lock.pop_earliest_shared_job()
-        };
+        loop {
+            let job = {
+                let mut lock = context.lock.lock().unwrap();
+                lock.pop_earliest_shared_job()
+            };
 
-        if let Some(job) = job {
-            // SAFETY:
-            // Any `Job` that was shared between threads is waited upon before
-            // the `JobStack` exits scope.
-            unsafe {
-                job.execute(&mut scope);
+            if let Some(job) = job {
+                // SAFETY:
+                // Any `Job` that was shared between threads is waited upon before
+                // the `JobStack` exits scope.
+                unsafe {
+                    job.execute(&mut scope);
+                }
+            }
+
+            if first_run {
+                first_run = false;
+                barrier.wait();
+            };
+
+            let lock = context.lock.lock().map_err(|_| PoisonError::new(()))?;
+            // TODO: acquire/release_thread
+            if lock.is_stopping || context.job_is_ready.wait(lock).is_err() {
+                break;
             }
         }
-
-        if first_run {
-            first_run = false;
-            barrier.wait();
-        };
-
-        let lock = context.lock.lock().map_err(|_| PoisonError::new(()))?;
-        // TODO: acquire/release_thread
-        if lock.is_stopping || context.job_is_ready.wait(lock).is_err() {
-            break;
-        }
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
 fn execute_heartbeat(
@@ -291,26 +321,24 @@ impl<'s> Scope<'s> {
     /// # use chili::Scope;
     /// let _s = Scope::global();
     /// ```
-    pub fn with_current<F, R>(f: F) -> Option<R>
+    pub fn with_current<F, R>(f: F) -> R
     where
-        F: FnOnce(Scope<'_>) -> R,
+        F: FnOnce(Option<Scope<'_>>) -> R,
     {
-        ThreadPool::with_current(|pool| f(pool.scope()))
+        f(REGISTERED_CONTEXT
+            .with(|ctx| ctx.take().clone())
+            .map(|ctx| ctx.new_from_thread_pool()))
+    }
+
+    pub fn register<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        self.context.clone().register(f)
     }
 
     fn new_from_thread_pool(thread_pool: &'s ThreadPool) -> Self {
-        let heartbeat = thread_pool.context.lock.lock().unwrap().new_heartbeat();
-        thread_pool
-            .context
-            .scope_created_from_thread_pool
-            .notify_one();
-
-        Self {
-            context: thread_pool.context.clone(),
-            job_queue: ThreadJobQueue::Current(JobQueue::default()),
-            heartbeat,
-            join_count: 0,
-        }
+        thread_pool.context.clone().new_from_thread_pool()
     }
 
     fn new_from_worker(context: Arc<Context>, job_queue: &'s mut JobQueue) -> Self {
@@ -536,12 +564,13 @@ impl<'s> Scope<'s> {
     {
         // FIXME: Temporary workaround
         let (tx, rx) = mpsc::sync_channel(1);
+        let ctx = self.context.clone();
         let f = move |scope: &mut Scope<'_>| {
             if scope.heartbeat.load(Ordering::Relaxed) {
                 scope.heartbeat();
             }
 
-            tx.send(f(scope)).unwrap();
+            tx.send(ctx.register(|| f(scope))).unwrap();
         };
 
         let stack = JobStack::new(f);
@@ -577,7 +606,7 @@ impl Default for Config {
 }
 
 thread_local! {
-    static REGISTERED_THREAD_POOL: Cell<*const ThreadPool> = const { Cell::new(ptr::null()) };
+    static REGISTERED_CONTEXT: RefCell<Option<Arc<Context>>> = const { RefCell::new(None) };
 }
 
 /// A thread pool for running fork-join workloads.
@@ -709,7 +738,7 @@ impl ThreadPool {
                 })),
                 deadlock_handler: config.deadlock_handler,
             };
-            let result = pool.register(with_pool);
+            let result = pool.context.clone().register(with_pool);
             drop(pool);
             worker_handles.into_iter().for_each(|worker| {
                 // FIXME: to ignore panics or not to?
@@ -717,63 +746,6 @@ impl ThreadPool {
             });
             Ok(result)
         })
-    }
-
-    /// Sets the global thread pool to this one.
-    ///
-    /// The global thread pool can only be set once. Any subsequent call will
-    /// return the thread pool back.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::{num::NonZero, time::Duration};
-    /// # use chili::{Config, ThreadPool};
-    /// ThreadPool::with_config(Config {
-    ///     thread_count: Some(NonZero::new(1).unwrap()),
-    ///     heartbeat_interval: Duration::from_micros(50),
-    ///     stack_size: Some(NonZero::new(128 * 1024).unwrap()),
-    ///     ..Config::default()
-    /// })
-    /// .set_global()
-    /// .ok()
-    /// .unwrap();
-    /// ```
-    pub fn register<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        struct RestorePool(*const ThreadPool);
-        impl Drop for RestorePool {
-            fn drop(&mut self) {
-                REGISTERED_THREAD_POOL.set(self.0);
-            }
-        }
-
-        let _old_pool = RestorePool(REGISTERED_THREAD_POOL.replace(self));
-        f()
-    }
-
-    /// Returns the global thread pool.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use chili::ThreadPool;
-    /// let mut s = ThreadPool::global().scope();
-    ///
-    /// let mut vals = [0; 2];
-    /// let (left, right) = vals.split_at_mut(1);
-    ///
-    /// s.join(|_| left[0] = 1, |_| right[0] = 1);
-    ///
-    /// assert_eq!(vals, [1; 2]);
-    /// ```
-    pub fn with_current<F, R>(f: F) -> Option<R>
-    where
-        F: FnOnce(&ThreadPool) -> R,
-    {
-        unsafe { REGISTERED_THREAD_POOL.get().as_ref() }.map(f)
     }
 
     /// Returns a `Scope`d object that you can run fork-join workloads on.
