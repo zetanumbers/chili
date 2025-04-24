@@ -48,6 +48,7 @@
 use std::{
     cell::RefCell,
     collections::{btree_map::Entry, BTreeMap, HashMap},
+    fmt::Display,
     io,
     num::NonZero,
     ops::{Deref, DerefMut},
@@ -326,7 +327,7 @@ impl<'s> Scope<'s> {
         F: FnOnce(Option<Scope<'_>>) -> R,
     {
         f(REGISTERED_CONTEXT
-            .with(|ctx| ctx.take().clone())
+            .with_borrow(|ctx| ctx.clone())
             .map(|ctx| ctx.new_from_thread_pool()))
     }
 
@@ -579,22 +580,6 @@ impl<'s> Scope<'s> {
         self.share_job(job);
         rx.recv().unwrap()
     }
-
-    pub fn mark_blocked(&self) {
-        let mut lcx = self.context.lock.lock().unwrap();
-        lcx.unblocked_threads = lcx.unblocked_threads.checked_sub(1).unwrap();
-        if lcx.unblocked_threads == 0 {
-            if let Some(handler) = self.context.deadlock_handler.as_ref() {
-                handler()
-            }
-        }
-    }
-
-    pub fn mark_unblocked(&self) {
-        let mut lcx = self.context.lock.lock().unwrap();
-        lcx.unblocked_threads += 1;
-        assert!(lcx.unblocked_threads <= self.context.thread_count);
-    }
 }
 
 /// `ThreadPool` configuration.
@@ -807,6 +792,39 @@ impl Drop for ThreadPool {
             handle.join().unwrap();
         }
     }
+}
+
+#[derive(Debug)]
+pub struct OutsideOfContextError(());
+
+impl Display for OutsideOfContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        "outside of any registered chili context".fmt(f)
+    }
+}
+
+pub fn mark_blocked() -> Result<(), OutsideOfContextError> {
+    REGISTERED_CONTEXT.with_borrow(|ctx| {
+        let ctx = ctx.as_deref().ok_or(OutsideOfContextError(()))?;
+        let mut lcx = ctx.lock.lock().unwrap();
+        lcx.unblocked_threads = lcx.unblocked_threads.checked_sub(1).unwrap();
+        if lcx.unblocked_threads == 0 {
+            if let Some(handler) = ctx.deadlock_handler.as_ref() {
+                handler()
+            }
+        }
+        Ok(())
+    })
+}
+
+pub fn mark_unblocked() -> Result<(), OutsideOfContextError> {
+    REGISTERED_CONTEXT.with_borrow(|ctx| {
+        let ctx = ctx.as_deref().ok_or(OutsideOfContextError(()))?;
+        let mut lcx = ctx.lock.lock().unwrap();
+        lcx.unblocked_threads += 1;
+        assert!(lcx.unblocked_threads <= ctx.thread_count);
+        Ok(())
+    })
 }
 
 #[cfg(test)]
