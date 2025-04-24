@@ -542,7 +542,7 @@ impl<'s> Scope<'s> {
         };
 
         let stack = JobStack::new(f);
-        let job = Job::new(&stack);
+        let job = Job::for_injection(&stack);
 
         self.share_job(job);
         rx.recv().unwrap()

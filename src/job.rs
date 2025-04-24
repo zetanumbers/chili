@@ -234,6 +234,16 @@ impl<T> Job<T> {
 }
 
 impl Job {
+    pub fn for_injection<F>(stack: &JobStack<F>) -> Self
+    where
+        F: FnOnce(&mut Scope<'_>) + Send,
+    {
+        let job = Job::new(stack);
+        job.fut
+            .set(NonNull::new(Box::into_raw(Box::new(Future::default()))));
+        job
+    }
+
     /// SAFETY:
     /// It should only be called while the `JobStack` it was created with is
     /// still alive and after being popped from a `JobQueue`.
@@ -280,7 +290,7 @@ impl JobQueue {
         // `Job` is still alive as per contract in `push_back`.
         let job = unsafe { self.0.pop_front()?.as_ref() };
         job.fut
-            .set(Some(Box::leak(Box::new(Future::default())).into()));
+            .set(NonNull::new(Box::into_raw(Box::new(Future::default()))));
 
         Some(job.clone())
     }
