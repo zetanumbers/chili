@@ -690,6 +690,8 @@ impl ThreadPool {
                 builder.spawn_scoped(scope, move || wrapper(thread))?;
             }
 
+            worker_barrier.wait();
+
             let pool = ThreadPool {
                 thread_count,
                 context: context.clone(),
