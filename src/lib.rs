@@ -118,11 +118,12 @@ impl LockContext {
     }
 }
 
-#[derive(Debug)]
 struct Context {
     lock: Mutex<LockContext>,
     job_is_ready: Condvar,
     scope_created_from_thread_pool: Condvar,
+    deadlock_handler: Option<Box<DeadlockHandler>>,
+    thread_count: usize,
 }
 
 impl Context {
@@ -304,7 +305,6 @@ impl DerefMut for ThreadJobQueue<'_> {
 ///
 /// assert_eq!(vals, [1; 2]);
 /// ```
-#[derive(Debug)]
 pub struct Scope<'s> {
     context: Arc<Context>,
     job_queue: ThreadJobQueue<'s>,
@@ -579,6 +579,22 @@ impl<'s> Scope<'s> {
         self.share_job(job);
         rx.recv().unwrap()
     }
+
+    pub fn mark_blocked(&self) {
+        let mut lcx = self.context.lock.lock().unwrap();
+        lcx.unblocked_threads = lcx.unblocked_threads.checked_sub(1).unwrap();
+        if lcx.unblocked_threads == 0 {
+            if let Some(handler) = self.context.deadlock_handler.as_ref() {
+                handler()
+            }
+        }
+    }
+
+    pub fn mark_unblocked(&self) {
+        let mut lcx = self.context.lock.lock().unwrap();
+        lcx.unblocked_threads += 1;
+        assert!(lcx.unblocked_threads <= self.context.thread_count);
+    }
 }
 
 /// `ThreadPool` configuration.
@@ -612,10 +628,8 @@ thread_local! {
 /// A thread pool for running fork-join workloads.
 pub struct ThreadPool {
     context: Arc<Context>,
-    thread_count: usize,
     worker_handles: Vec<JoinHandle<()>>,
     heartbeat_handle: Option<JoinHandle<()>>,
-    deadlock_handler: Option<Box<DeadlockHandler>>,
 }
 
 impl ThreadPool {
@@ -657,6 +671,8 @@ impl ThreadPool {
             lock: Mutex::new(LockContext::new(thread_count)),
             job_is_ready: Condvar::new(),
             scope_created_from_thread_pool: Condvar::new(),
+            deadlock_handler: config.deadlock_handler,
+            thread_count,
         });
 
         let worker_handles = (0..thread_count)
@@ -678,13 +694,11 @@ impl ThreadPool {
         worker_barrier.wait();
 
         Self {
-            thread_count,
             context: context.clone(),
             worker_handles,
             heartbeat_handle: Some(thread::spawn(move || {
                 execute_heartbeat(context, config.heartbeat_interval, thread_count);
             })),
-            deadlock_handler: config.deadlock_handler,
         }
     }
 
@@ -701,9 +715,11 @@ impl ThreadPool {
         let worker_barrier = Arc::new(Barrier::new(thread_count + 1));
 
         let context = Arc::new(Context {
+            thread_count,
             lock: Mutex::new(LockContext::new(thread_count)),
             job_is_ready: Condvar::new(),
             scope_created_from_thread_pool: Condvar::new(),
+            deadlock_handler: config.deadlock_handler,
         });
 
         std::thread::scope(|scope| {
@@ -729,14 +745,12 @@ impl ThreadPool {
             worker_barrier.wait();
 
             let pool = ThreadPool {
-                thread_count,
                 context: context.clone(),
                 // FIXME: join is handled by drop impl
                 worker_handles: Vec::new(),
                 heartbeat_handle: Some(thread::spawn(move || {
                     execute_heartbeat(context, config.heartbeat_interval, thread_count);
                 })),
-                deadlock_handler: config.deadlock_handler,
             };
             let result = pool.context.clone().register(with_pool);
             drop(pool);
@@ -766,22 +780,6 @@ impl ThreadPool {
     /// ```
     pub fn scope(&self) -> Scope<'_> {
         Scope::new_from_thread_pool(self)
-    }
-
-    pub fn mark_blocked(&self) {
-        let mut lcx = self.context.lock.lock().unwrap();
-        lcx.unblocked_threads = lcx.unblocked_threads.checked_sub(1).unwrap();
-        if lcx.unblocked_threads == 0 {
-            if let Some(handler) = self.deadlock_handler.as_ref() {
-                handler()
-            }
-        }
-    }
-
-    pub fn mark_unblocked(&self) {
-        let mut lcx = self.context.lock.lock().unwrap();
-        lcx.unblocked_threads += 1;
-        assert!(lcx.unblocked_threads <= self.thread_count);
     }
 }
 
