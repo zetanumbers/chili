@@ -654,10 +654,10 @@ impl ThreadPool {
         }
     }
 
-    pub fn scoped_with_config<W, F, R>(config: Config, wrapper: W, with_pool: F) -> io::Result<R>
+    pub fn scoped_global<W, F, R>(config: Config, wrapper: W, with_pool: F) -> io::Result<R>
     where
         W: Fn(ThreadBuilder) + Sync, // expected to call `run()`
-        F: FnOnce(&Self) -> R,
+        F: FnOnce() -> R,
     {
         let thread_count = config
             .thread_count
@@ -700,8 +700,11 @@ impl ThreadPool {
                 })),
                 deadlock_handler: config.deadlock_handler,
             };
+            pool.set_global()
+                .ok()
+                .expect("Global thread pool is already set");
 
-            Ok(with_pool(&pool))
+            Ok(with_pool())
         })
     }
 
