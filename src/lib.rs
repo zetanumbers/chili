@@ -194,38 +194,37 @@ impl ThreadBuilder {
 }
 
 fn execute_worker(context: Arc<Context>, barrier: Arc<Barrier>) -> LockResult<()> {
-    let mut first_run = true;
-
     context.clone().register(|| {
         let mut job_queue = JobQueue::default();
         let mut scope = Scope::new_from_worker(context.clone(), &mut job_queue);
 
+        barrier.wait();
+
+        let mut lock = context.lock.lock().map_err(|_| PoisonError::new(()))?;
         loop {
-            let job = {
-                let mut lock = context.lock.lock().unwrap();
-                lock.pop_earliest_shared_job()
-            };
-
-            if let Some(job) = job {
-                // SAFETY:
-                // Any `Job` that was shared between threads is waited upon before
-                // the `JobStack` exits scope.
-                unsafe {
-                    job.execute(&mut scope);
-                }
-            }
-
-            if first_run {
-                first_run = false;
-                barrier.wait();
-            };
-
-            let lock = context.lock.lock().map_err(|_| PoisonError::new(()))?;
-            // TODO: acquire/release_thread
-            if lock.is_stopping || context.job_is_ready.wait(lock).is_err() {
+            if lock.is_stopping {
                 break;
             }
+            lock = context
+                .job_is_ready
+                .wait(lock)
+                .map_err(|_| PoisonError::new(()))?;
+            let job = lock.pop_earliest_shared_job();
+            let Some(job) = job else {
+                // preserve lock to immediatelly wait for fresh jobs
+                continue;
+            };
+
+            drop(lock);
+            // SAFETY:
+            // Any `Job` that was shared between threads is waited upon before
+            // the `JobStack` exits scope.
+            unsafe {
+                job.execute(&mut scope);
+            }
+            lock = context.lock.lock().map_err(|_| PoisonError::new(()))?
         }
+
         Ok(())
     })
 }
