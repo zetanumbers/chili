@@ -201,8 +201,9 @@ impl<T> Job<T> {
 
     /// SAFETY:
     /// It should only be called after being popped from a `JobQueue`.
-    pub unsafe fn wait(&self) -> Option<thread::Result<T>> {
+    pub unsafe fn wait(&self, scope: &Scope<'_>) -> Option<thread::Result<T>> {
         self.fut.get().and_then(|fut| {
+            scope.context.release_thread();
             // SAFETY:
             // Before being popped, the `JobQueue` allocates and stores a
             // `Future` in `self.fur_or_next` that should get passed here.
@@ -213,6 +214,7 @@ impl<T> Job<T> {
             unsafe {
                 drop(Box::from_raw(fut.as_ptr()));
             }
+            scope.context.acquire_thread();
 
             result
         })

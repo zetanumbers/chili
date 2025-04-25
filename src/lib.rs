@@ -164,6 +164,18 @@ impl Context {
         let _old_pool = RestorePool(REGISTERED_CONTEXT.replace(Some(self)));
         f()
     }
+
+    fn release_thread(&self) {
+        if let Some(release_thread_handler) = &self.release_thread_handler {
+            release_thread_handler()
+        }
+    }
+
+    fn acquire_thread(&self) {
+        if let Some(acquire_thread_handler) = &self.acquire_thread_handler {
+            acquire_thread_handler()
+        }
+    }
 }
 
 /// Thread builder used to initialize thread-locals via
@@ -216,12 +228,15 @@ fn execute_worker(context: Arc<Context>, barrier: Arc<Barrier>) -> LockResult<()
             };
 
             drop(lock);
+
+            context.acquire_thread();
             // SAFETY:
             // Any `Job` that was shared between threads is waited upon before
             // the `JobStack` exits scope.
             unsafe {
                 job.execute(&mut scope);
             }
+            context.release_thread();
             lock = context.lock.lock().map_err(|_| PoisonError::new(()))?
         }
 
@@ -406,7 +421,7 @@ impl<'s> Scope<'s> {
         // SAFETY:
         // Any `Job` that was shared between threads is waited upon before the
         // `JobStack` exits scope.
-        unsafe { job.wait() }
+        unsafe { job.wait(self) }
     }
 
     #[cold]
