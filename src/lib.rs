@@ -69,6 +69,14 @@ use job::{Job, JobQueue, JobStack};
 /// The type for a closure that gets invoked when the Chili thread pool deadlocks
 type DeadlockHandler = dyn Fn() + Send + Sync;
 
+/// The type for a closure that gets invoked before starting computations in a thread.
+/// Note that this same closure may be invoked multiple times in parallel.
+type AcquireThreadHandler = dyn Fn() + Send + Sync;
+
+/// The type for a closure that gets invoked before blocking in a thread.
+/// Note that this same closure may be invoked multiple times in parallel.
+type ReleaseThreadHandler = dyn Fn() + Send + Sync;
+
 #[derive(Debug)]
 struct Heartbeat {
     is_set: Weak<AtomicBool>,
@@ -124,6 +132,8 @@ struct Context {
     job_is_ready: Condvar,
     scope_created_from_thread_pool: Condvar,
     deadlock_handler: Option<Box<DeadlockHandler>>,
+    acquire_thread_handler: Option<Box<AcquireThreadHandler>>,
+    release_thread_handler: Option<Box<ReleaseThreadHandler>>,
     thread_count: usize,
 }
 
@@ -593,6 +603,10 @@ pub struct Config {
     pub stack_size: Option<NonZero<usize>>,
     /// Closure invoked on deadlock.
     pub deadlock_handler: Option<Box<DeadlockHandler>>,
+    /// Closure invoked when starting computations in a thread.
+    pub acquire_thread_handler: Option<Box<AcquireThreadHandler>>,
+    /// Closure invoked when blocking in a thread.
+    pub release_thread_handler: Option<Box<ReleaseThreadHandler>>,
 }
 
 impl Default for Config {
@@ -602,6 +616,8 @@ impl Default for Config {
             heartbeat_interval: Duration::from_micros(100),
             stack_size: None,
             deadlock_handler: None,
+            acquire_thread_handler: None,
+            release_thread_handler: None,
         }
     }
 }
@@ -657,6 +673,8 @@ impl ThreadPool {
             job_is_ready: Condvar::new(),
             scope_created_from_thread_pool: Condvar::new(),
             deadlock_handler: config.deadlock_handler,
+            acquire_thread_handler: config.acquire_thread_handler,
+            release_thread_handler: config.release_thread_handler,
             thread_count,
         });
 
@@ -705,6 +723,8 @@ impl ThreadPool {
             job_is_ready: Condvar::new(),
             scope_created_from_thread_pool: Condvar::new(),
             deadlock_handler: config.deadlock_handler,
+            acquire_thread_handler: config.acquire_thread_handler,
+            release_thread_handler: config.release_thread_handler,
         });
 
         std::thread::scope(|scope| {
@@ -737,6 +757,7 @@ impl ThreadPool {
                     execute_heartbeat(context, config.heartbeat_interval, thread_count);
                 })),
             };
+            // TODO: pass down thread pool reference
             let result = pool.context.clone().register(with_pool);
             drop(pool);
             worker_handles.into_iter().for_each(|worker| {
@@ -947,8 +968,7 @@ mod tests {
         let threat_pool = ThreadPool::with_config(Config {
             thread_count: Some(NonZero::new(2).unwrap()),
             heartbeat_interval: Duration::from_micros(1),
-            stack_size: None,
-            deadlock_handler: None,
+            ..Default::default()
         });
 
         if let Some(thread_count) = thread::available_parallelism().ok().map(NonZero::get) {
